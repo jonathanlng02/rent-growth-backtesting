@@ -391,24 +391,51 @@ df = pd.concat([df, cluster_dum], axis=1)
 CLUSTER_COLS = list(cluster_dum.columns)
 print(f'Cluster dummies: {CLUSTER_COLS} (ref={ref_cluster})')""")
 
-add("code", """# Visualize cluster profiles
+add("code", """# Visualize cluster profiles with ACTUAL values
 centers = pd.DataFrame(scaler_km.inverse_transform(km_final.cluster_centers_),
                         columns=CLUSTER_FEATURES)
 centers.index = [f'Cluster {i}' for i in range(best_k)]
 
-fig, axes = plt.subplots(1, 2, figsize=(20, 8))
+fig, axes = plt.subplots(1, 2, figsize=(22, 10))
 
-# Heatmap of standardized cluster centers
-centers_std = pd.DataFrame(km_final.cluster_centers_, columns=CLUSTER_FEATURES,
-                            index=[f'Cluster {i}' for i in range(best_k)])
-sns.heatmap(centers_std.T, annot=True, fmt='.2f', cmap='RdBu_r', center=0, ax=axes[0])
-axes[0].set_title('Cluster Profiles (Standardized Feature Means)')
+# Heatmap: color by per-feature percentile rank, annotate with actual values
+# Normalize each feature row to 0-1 for coloring (low=blue, high=red)
+centers_norm = centers.T.copy()
+for feat in centers_norm.index:
+    row = centers_norm.loc[feat]
+    rng = row.max() - row.min()
+    centers_norm.loc[feat] = (row - row.min()) / rng if rng > 0 else 0.5
+
+# Format annotations: $ for dollar values, % for rates, plain for others
+def fmt_val(feat, val):
+    if feat in ('median_hh_income', 'median_home_value'):
+        return f'${val:,.0f}'
+    elif feat in ('pct_renter', 'pct_college', 'poverty_rate', 'vacancy_rate',
+                  'rent_to_income', 'pct_public_transit', 'pct_res_high_wage',
+                  'pct_res_professional', 'unemployment_rate'):
+        return f'{val:.1%}'
+    elif feat in ('median_age',):
+        return f'{val:.1f}'
+    elif feat in ('worker_density',):
+        return f'{val:.2f}'
+    else:
+        return f'{val:.1f}'
+
+annot_labels = np.array([[fmt_val(feat, centers.loc[cl, feat])
+                           for cl in centers.index]
+                          for feat in CLUSTER_FEATURES])
+
+sns.heatmap(centers_norm, annot=annot_labels, fmt='', cmap='RdBu_r', center=0.5,
+            vmin=0, vmax=1, ax=axes[0], linewidths=0.5)
+axes[0].set_title('Cluster Profiles (Actual Values, colored by relative rank)')
+axes[0].set_xlabel(''); axes[0].set_ylabel('')
 
 # Cluster sizes and avg rent growth
 cluster_stats = df[df['rent_growth'].notna()].groupby('cluster').agg(
     n_tracts=('GEOID', 'nunique'),
     avg_rent_growth=('rent_growth', 'mean'),
     med_income=('median_hh_income', 'median'),
+    med_rent=('median_gross_rent', 'median'),
 ).reset_index()
 bars = axes[1].bar(cluster_stats['cluster'].astype(str), cluster_stats['avg_rent_growth'],
                     color=plt.cm.Set2(np.linspace(0, 1, best_k)), edgecolor='black')
@@ -417,11 +444,12 @@ axes[1].set_title('Average Rent Growth by Cluster')
 axes[1].axhline(y=0, color='black', lw=0.5, ls='--')
 for bar, (_, row) in zip(bars, cluster_stats.iterrows()):
     axes[1].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.001,
-                  f'n={int(row["n_tracts"])}', ha='center', fontsize=9)
+                  f'n={int(row["n_tracts"])}\\n${row["med_income"]:,.0f} inc\\n${row["med_rent"]:,.0f} rent',
+                  ha='center', fontsize=8)
 plt.tight_layout(); plt.show()
 
-print('\\nCluster Centers (original scale):')
-print(centers.round(1).to_string())""")
+print('\\nCluster Centers (actual values):')
+print(centers.round(2).to_string())""")
 
 # ═══════════════════════════════════════════════════════════════
 # PREPARE MODELING DATA
@@ -994,15 +1022,47 @@ else:
     axes[0].legend()
     latest = tract.iloc[-1]
     top_features = importance_df.head(10).index
-    feat_vals = latest[top_features]
-    axes[1].barh(range(len(feat_vals)), feat_vals.values, color='#1976d2', alpha=0.8)
-    axes[1].set_yticks(range(len(feat_vals)))
-    axes[1].set_yticklabels(top_features, fontsize=9)
-    axes[1].set_title(f'Top Feature Values ({int(latest["year"])})')
+
+    # Standardize feature values for comparable bar lengths (z-scores vs all tracts)
+    all_means = df_clean[top_features].mean()
+    all_stds = df_clean[top_features].std()
+    feat_raw = latest[top_features]
+    feat_z = (feat_raw - all_means) / all_stds
+
+    # Plot bars using z-scores, label with actual values
+    rank_labels = [f'#{i+1} {f}' for i, f in enumerate(top_features)]
+    colors = ['#d32f2f' if z < 0 else '#1976d2' for z in feat_z]
+    bars = axes[1].barh(range(len(feat_z)), feat_z.values, color=colors, alpha=0.8)
+    axes[1].set_yticks(range(len(feat_z)))
+    axes[1].set_yticklabels(rank_labels, fontsize=9)
+    axes[1].set_xlabel('Std. deviations from mean (z-score)')
+    axes[1].set_title(f'Top 10 Features by Importance — This Tract ({int(latest["year"])})')
+    axes[1].axvline(x=0, color='black', lw=0.5)
+
+    # Data labels: show actual values
+    for bar, (feat, raw_val) in zip(bars, feat_raw.items()):
+        if feat in ('median_hh_income', 'median_home_value'):
+            lbl = f'${raw_val:,.0f}'
+        elif any(feat.startswith(p) for p in ('pct_', 'vacancy', 'poverty', 'unemployment', 'rent_burden', 'labor_')):
+            lbl = f'{raw_val:.1%}'
+        elif feat in ('rent_to_income',):
+            lbl = f'{raw_val:.2f}'
+        elif feat in ('median_age',):
+            lbl = f'{raw_val:.1f} yrs'
+        elif feat in ('worker_density',):
+            lbl = f'{raw_val:.2f}'
+        else:
+            lbl = f'{raw_val:.4f}' if abs(raw_val) < 1 else f'{raw_val:,.1f}'
+        x_pos = bar.get_width()
+        ha = 'left' if x_pos >= 0 else 'right'
+        axes[1].text(x_pos + (0.05 if x_pos >= 0 else -0.05), bar.get_y() + bar.get_height()/2,
+                      f' {lbl}', ha=ha, va='center', fontsize=8, fontweight='bold')
+
     plt.tight_layout(); plt.show()
     print(f'Tract {EXPLORE_GEOID} ({cbsa_name}, Cluster {cl})')
     print(f'  Avg rent growth: {tract[TARGET].mean():.4f}  |  Predicted: {tract["predicted_rg"].mean():.4f}')
-    print(f'  R2: {r2_score(tract[TARGET], tract["predicted_rg"]):.4f}')""")
+    print(f'  R2: {r2_score(tract[TARGET], tract["predicted_rg"]):.4f}')
+    print(f'  Bar chart shows z-scores (how this tract compares to all tracts); labels show actual values.')""")
 
 # ── Version comparison ──
 add("markdown", "---\\n## 7. Version Comparison (v2 → v3 → v4)")

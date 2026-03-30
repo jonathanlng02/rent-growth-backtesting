@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Environment
+.env
+*.key
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Claude
+.claude/

@@ -1,4 +1,4 @@
-"""Build the v3 rent growth analysis notebook with enhanced models and features."""
+"""Build the v4 rent growth analysis notebook with spatial weights, clustering, TSCV, and stacking."""
 import json
 
 nb = {
@@ -22,21 +22,19 @@ def add(ctype, src):
 # ═══════════════════════════════════════════════════════════════
 # SECTION 1: SETUP
 # ═══════════════════════════════════════════════════════════════
-add("markdown", """# Rent Growth Performance Drivers: Tract-Level Analysis (v3)
+add("markdown", """# Rent Growth Performance Drivers: Tract-Level Analysis (v4)
 
 Analyze what drives **real** year-over-year rent growth at the census tract level using ACS 5-Year estimates,
 LEHD LODES residence-based employment data, and national macro indicators across 5 CBSAs:
 Boston, Dallas-Fort Worth, San Francisco, Denver, and Los Angeles.
 
-**Dependent variable:** Real YoY rent growth (nominal rent growth adjusted for CPI inflation)
-
-### v3 Enhancements over v2
+### v4 Enhancements over v3
 | Category | Improvement |
 |----------|------------|
-| **Features** | Lagged rent growth (autoregressive), spatial lag, relative-to-CBSA features, housing supply growth, interaction terms |
-| **Models** | Added LightGBM, CatBoost, Panel Fixed Effects, Two-Stage decomposition |
-| **Output** | Tract-level prediction time series, interactive tract explorer, comprehensive model comparison |
-| **Data** | 2017-2023 modeling window (2015-2016 used for lags) |
+| **Spatial** | True queen-contiguity spatial weights from Census TIGER tract boundaries (replaces county-average proxy) |
+| **Clustering** | K-means neighborhood archetypes — tracts grouped by demographic/economic profile |
+| **Validation** | Expanding-window time-series cross-validation for temporal robustness |
+| **Ensemble** | Stacked ensemble of LightGBM + XGBoost + CatBoost + RF with Ridge meta-learner |
 
 By Jonathan Ling (2026)""")
 
@@ -44,25 +42,28 @@ add("code", """import pandas as pd
 import numpy as np
 import seaborn as sns
 import matplotlib.pyplot as plt
-import requests, warnings
+import requests, warnings, os
 from census import Census
 from us import states
-from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.model_selection import train_test_split, cross_val_score, cross_val_predict
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import Lasso, LassoCV
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+from sklearn.linear_model import Lasso, LassoCV, Ridge
+from sklearn.ensemble import RandomForestRegressor, StackingRegressor
+from sklearn.cluster import KMeans
+from sklearn.metrics import r2_score, mean_absolute_error, silhouette_score
 import statsmodels.api as sm
 import xgboost as xgb
 import lightgbm as lgb
 from catboost import CatBoostRegressor
 from linearmodels.panel import PanelOLS
+import geopandas as gpd
+from libpysal.weights import Queen
 
 warnings.filterwarnings('ignore')
 sns.set_style('whitegrid')
 plt.rcParams['figure.figsize'] = (12, 6)
 plt.rcParams['figure.dpi'] = 100
-print('All packages loaded.')""")
+print('All packages loaded (v4: + geopandas, libpysal, KMeans, StackingRegressor).')""")
 
 add("code", """# ============================================================
 # CONFIGURATION
@@ -79,6 +80,7 @@ CBSA_COUNTIES = {
     'Los Angeles': [('06', ['037', '059'])],
 }
 STATE_ABBR = {'06': 'ca', '08': 'co', '25': 'ma', '33': 'nh', '48': 'tx'}
+STATE_FIPS = sorted(set(sf for sc in CBSA_COUNTIES.values() for sf, _ in sc))
 
 MORTGAGE_RATE = {2015: 3.85, 2016: 3.65, 2017: 3.99, 2018: 4.54,
                  2019: 3.94, 2020: 3.11, 2021: 2.96, 2022: 5.34, 2023: 6.81}
@@ -87,7 +89,7 @@ CPI_ANNUAL = {2014: 236.7, 2015: 237.0, 2016: 240.0, 2017: 245.1, 2018: 251.1,
 INFLATION_RATE = {yr: (CPI_ANNUAL[yr] - CPI_ANNUAL[yr-1]) / CPI_ANNUAL[yr-1] for yr in range(2015, 2024)}
 
 MIN_RENTER_UNITS = 100
-print(f'Config: {len(YEARS)} years, {len(CBSA_COUNTIES)} CBSAs, min renters={MIN_RENTER_UNITS}')""")
+print(f'Config: {len(YEARS)} years, {len(CBSA_COUNTIES)} CBSAs, {len(STATE_FIPS)} states')""")
 
 # ═══════════════════════════════════════════════════════════════
 # SECTION 2: DATA ACQUISITION
@@ -180,6 +182,28 @@ df_lodes = pd.concat(all_lodes, ignore_index=True)
 print(f'\\nLODES RAC shape: {df_lodes.shape}')""")
 
 # ═══════════════════════════════════════════════════════════════
+# NEW v4: TRACT BOUNDARIES FOR SPATIAL WEIGHTS
+# ═══════════════════════════════════════════════════════════════
+add("markdown", """### 1c. Census TIGER Tract Boundaries (v4)
+Download tract boundary shapefiles to build a **queen contiguity** spatial weights matrix.
+Two tracts are neighbors if they share an edge or vertex.""")
+
+add("code", """# Download TIGER/Line tract boundaries for each state
+print('Downloading tract shapefiles from Census TIGER...')
+gdfs = []
+for sf in STATE_FIPS:
+    url = f'https://www2.census.gov/geo/tiger/TIGER2023/TRACT/tl_2023_{sf}_tract.zip'
+    try:
+        gdf = gpd.read_file(url)
+        gdfs.append(gdf[['GEOID', 'geometry']])
+        print(f'  State {sf}: {len(gdf):,} tracts')
+    except Exception as e:
+        print(f'  Warning: Failed to download {sf}: {e}')
+
+tracts_geo = pd.concat(gdfs, ignore_index=True)
+print(f'\\nTotal tract boundaries: {len(tracts_geo):,}')""")
+
+# ═══════════════════════════════════════════════════════════════
 # SECTION 3: DATA PROCESSING
 # ═══════════════════════════════════════════════════════════════
 add("markdown", "---\\n## 2. Data Processing & Feature Engineering")
@@ -238,63 +262,73 @@ df['housing_unit_growth'] = df.groupby('GEOID')['total_housing_units'].pct_chang
 
 print(f'Rent growth computed. Median nominal: {df["nominal_rent_growth"].median():.4f}, real: {df["rent_growth"].median():.4f}')""")
 
-add("markdown", """### New v3 Features
-- **Lagged rent growth**: Prior year's rent growth (autoregressive signal)
-- **Spatial lag**: Average rent growth of neighboring tracts (county-level proxy)
-- **Relative-to-CBSA**: Tract metrics normalized by CBSA median
-- **Housing supply**: Tract-level housing unit growth (net new supply)
-- **Interaction terms**: Combined effects of key variables""")
+add("markdown", """### v4 Features: True Spatial Weights & Neighborhood Archetypes""")
 
-add("code", """# ── LAGGED FEATURES (v3) ──
-# Prior year's rent growth is the single strongest predictor of current rent growth
+add("code", """# ── LAGGED FEATURES ──
 df['lagged_rent_growth'] = df.groupby('GEOID')['rent_growth'].shift(1)
 df['lagged_income_growth'] = df.groupby('GEOID')['income_growth'].shift(1)
 df['lagged_home_value_growth'] = df.groupby('GEOID')['home_value_growth'].shift(1)
-
-# 2-year rolling average rent growth (momentum signal)
 df['rent_growth_momentum'] = df.groupby('GEOID')['rent_growth'].transform(
     lambda x: x.shift(1).rolling(2, min_periods=1).mean()
 )
+print(f'Lagged features: {df["lagged_rent_growth"].notna().sum():,} / {len(df):,} obs')""")
 
-print('Lagged features computed.')
-print(f'  lagged_rent_growth coverage: {df["lagged_rent_growth"].notna().sum():,} / {len(df):,}')""")
+add("code", """# ── TRUE SPATIAL LAG via Queen Contiguity (v4) ──
+# Build spatial weights from tract boundaries
+our_geoids = set(df['GEOID'].unique())
+tracts_filtered = tracts_geo[tracts_geo['GEOID'].isin(our_geoids)].copy().reset_index(drop=True)
+print(f'Building queen contiguity for {len(tracts_filtered):,} tracts...')
+W = Queen.from_dataframe(tracts_filtered, idVariable='GEOID', silence_warnings=True)
+print(f'  Mean neighbors: {W.mean_neighbors:.1f}, Min: {W.min_neighbors}, Max: {W.max_neighbors}')
+print(f'  Islands (no neighbors): {len(W.islands)}')
 
-add("code", """# ── SPATIAL LAG (v3) ──
-# County-level average rent growth excluding each tract (neighborhood effect proxy)
+# Compute spatially-weighted average rent growth for each tract-year
+spatial_records = []
+for year in sorted(df['year'].unique()):
+    yr_rg = df.loc[df['year'] == year, ['GEOID', 'rent_growth']].dropna().set_index('GEOID')['rent_growth']
+    rg_dict = yr_rg.to_dict()
+    for geoid in yr_rg.index:
+        if geoid in W.neighbors and W.neighbors[geoid]:
+            nbr_vals = [rg_dict[n] for n in W.neighbors[geoid] if n in rg_dict]
+            sl = np.mean(nbr_vals) if nbr_vals else np.nan
+        else:
+            sl = np.nan
+        spatial_records.append({'GEOID': geoid, 'year': year, 'spatial_lag_queen': sl})
+
+df_spatial = pd.DataFrame(spatial_records)
+df = df.merge(df_spatial, on=['GEOID', 'year'], how='left')
+
+# Also keep county-level proxy for comparison
 df['county_fips'] = df['GEOID'].str[:5]
 county_agg = df.groupby(['county_fips', 'year']).agg(
-    _rg_sum=('rent_growth', 'sum'),
-    _rg_count=('rent_growth', 'count')
+    _rg_sum=('rent_growth', 'sum'), _rg_count=('rent_growth', 'count')
 ).reset_index()
 df = df.merge(county_agg, on=['county_fips', 'year'], how='left')
-df['spatial_lag_rg'] = (df['_rg_sum'] - df['rent_growth']) / (df['_rg_count'] - 1)
-df = df.drop(columns=['_rg_sum', '_rg_count'])
+df['spatial_lag_county'] = (df['_rg_sum'] - df['rent_growth']) / (df['_rg_count'] - 1)
+df.drop(columns=['_rg_sum', '_rg_count'], inplace=True)
+df['cbsa_avg_rg'] = df.groupby(['cbsa', 'year'])['rent_growth'].transform('mean')
 
-# CBSA-level average rent growth (broader market signal)
-cbsa_avg = df.groupby(['cbsa', 'year'])['rent_growth'].transform('mean')
-df['cbsa_avg_rg'] = cbsa_avg
+queen_corr = df['spatial_lag_queen'].corr(df['rent_growth'])
+county_corr = df['spatial_lag_county'].corr(df['rent_growth'])
+print(f'\\nSpatial lag correlations with rent growth:')
+print(f'  Queen contiguity: {queen_corr:.3f}')
+print(f'  County average:   {county_corr:.3f}')
+print(f'  Queen is {"better" if abs(queen_corr) > abs(county_corr) else "similar"}')""")
 
-print(f'Spatial lag computed. Correlation with rent growth: {df["spatial_lag_rg"].corr(df["rent_growth"]):.3f}')
-print(f'CBSA avg correlation: {df["cbsa_avg_rg"].corr(df["rent_growth"]):.3f}')""")
-
-add("code", """# ── RELATIVE-TO-CBSA FEATURES (v3) ──
-# Normalize tract values by CBSA median to capture relative position
+add("code", """# ── RELATIVE-TO-CBSA FEATURES ──
 cbsa_medians = df.groupby(['cbsa', 'year']).agg(
     _med_income=('median_hh_income', 'median'),
     _med_rent=('median_gross_rent', 'median'),
     _med_hv=('median_home_value', 'median'),
-    _med_pop=('population', 'median'),
 ).reset_index()
 df = df.merge(cbsa_medians, on=['cbsa', 'year'], how='left')
 df['income_vs_cbsa'] = df['median_hh_income'] / df['_med_income']
 df['rent_vs_cbsa'] = df['median_gross_rent'] / df['_med_rent']
 df['home_value_vs_cbsa'] = df['median_home_value'] / df['_med_hv']
-df = df.drop(columns=['_med_income', '_med_rent', '_med_hv', '_med_pop'])
+df.drop(columns=['_med_income', '_med_rent', '_med_hv'], inplace=True)
+print('Relative-to-CBSA features computed.')""")
 
-print('Relative-to-CBSA features computed.')
-print(f'  income_vs_cbsa range: {df["income_vs_cbsa"].quantile(0.05):.2f} - {df["income_vs_cbsa"].quantile(0.95):.2f}')""")
-
-add("code", """# ── INTERACTION TERMS (v3) ──
+add("code", """# ── INTERACTION TERMS ──
 df['pop_growth_x_vacancy'] = df['population_growth'] * df['vacancy_rate']
 df['income_growth_x_pct_renter'] = df['income_growth'] * df['pct_renter']
 df['supply_demand_ratio'] = df['housing_unit_growth'] / (df['population_growth'].clip(lower=0.001))
@@ -304,11 +338,95 @@ df['covid_2020'] = (df['year'] == 2020).astype(int)
 df['covid_2021'] = (df['year'] == 2021).astype(int)
 cbsa_dum = pd.get_dummies(df['cbsa'], prefix='cbsa', drop_first=False, dtype=int)
 df = pd.concat([df, cbsa_dum.drop(columns='cbsa_Los Angeles')], axis=1)
+print(f'Interactions and dummies computed. Columns: {df.shape[1]}')""")
 
-print(f'All features computed. Total columns: {df.shape[1]}')""")
+# ═══════════════════════════════════════════════════════════════
+# NEW v4: K-MEANS CLUSTERING
+# ═══════════════════════════════════════════════════════════════
+add("markdown", """### Neighborhood Archetypes via K-Means (v4)
+Cluster tracts by their average demographic/economic profile to identify **neighborhood archetypes**.
+Clusters capture combinations of features that commonly co-occur (e.g., "affluent suburban", "dense urban core",
+"working-class transit-oriented") — each archetype may have different rent growth dynamics.""")
 
+add("code", """# K-Means clustering on tract-level average profiles
+CLUSTER_FEATURES = [
+    'median_hh_income', 'median_age', 'median_home_value',
+    'pct_renter', 'pct_college', 'poverty_rate', 'vacancy_rate',
+    'rent_to_income', 'pct_public_transit', 'worker_density',
+    'pct_res_high_wage', 'pct_res_professional', 'unemployment_rate',
+]
+
+# Average each tract across years for a stable profile
+tract_profiles = df.groupby('GEOID')[CLUSTER_FEATURES].mean().dropna()
+scaler_km = StandardScaler()
+X_km = scaler_km.fit_transform(tract_profiles)
+print(f'Clustering {len(tract_profiles):,} tracts on {len(CLUSTER_FEATURES)} profile features')
+
+# Find optimal k via silhouette score
+sil_scores = {}
+for k in range(3, 9):
+    km = KMeans(n_clusters=k, random_state=42, n_init=10)
+    labels = km.fit_predict(X_km)
+    sil = silhouette_score(X_km, labels)
+    sil_scores[k] = sil
+    print(f'  k={k}: silhouette={sil:.4f}')
+
+best_k = max(sil_scores, key=sil_scores.get)
+print(f'\\nBest k={best_k} (silhouette={sil_scores[best_k]:.4f})')
+
+# Fit final model
+km_final = KMeans(n_clusters=best_k, random_state=42, n_init=10)
+tract_profiles['cluster'] = km_final.fit_predict(X_km)
+
+# Merge cluster labels into main df
+df = df.merge(tract_profiles[['cluster']].reset_index(), on='GEOID', how='left')
+# Fill unclustered tracts with most common cluster
+df['cluster'] = df['cluster'].fillna(df['cluster'].mode().iloc[0]).astype(int)
+
+# Create cluster dummies (drop last as reference)
+cluster_dum = pd.get_dummies(df['cluster'], prefix='cluster', dtype=int)
+ref_cluster = cluster_dum.columns[-1]
+cluster_dum = cluster_dum.drop(columns=ref_cluster)
+df = pd.concat([df, cluster_dum], axis=1)
+CLUSTER_COLS = list(cluster_dum.columns)
+print(f'Cluster dummies: {CLUSTER_COLS} (ref={ref_cluster})')""")
+
+add("code", """# Visualize cluster profiles
+centers = pd.DataFrame(scaler_km.inverse_transform(km_final.cluster_centers_),
+                        columns=CLUSTER_FEATURES)
+centers.index = [f'Cluster {i}' for i in range(best_k)]
+
+fig, axes = plt.subplots(1, 2, figsize=(20, 8))
+
+# Heatmap of standardized cluster centers
+centers_std = pd.DataFrame(km_final.cluster_centers_, columns=CLUSTER_FEATURES,
+                            index=[f'Cluster {i}' for i in range(best_k)])
+sns.heatmap(centers_std.T, annot=True, fmt='.2f', cmap='RdBu_r', center=0, ax=axes[0])
+axes[0].set_title('Cluster Profiles (Standardized Feature Means)')
+
+# Cluster sizes and avg rent growth
+cluster_stats = df[df['rent_growth'].notna()].groupby('cluster').agg(
+    n_tracts=('GEOID', 'nunique'),
+    avg_rent_growth=('rent_growth', 'mean'),
+    med_income=('median_hh_income', 'median'),
+).reset_index()
+bars = axes[1].bar(cluster_stats['cluster'].astype(str), cluster_stats['avg_rent_growth'],
+                    color=plt.cm.Set2(np.linspace(0, 1, best_k)), edgecolor='black')
+axes[1].set_xlabel('Cluster'); axes[1].set_ylabel('Avg Real Rent Growth')
+axes[1].set_title('Average Rent Growth by Cluster')
+axes[1].axhline(y=0, color='black', lw=0.5, ls='--')
+for bar, (_, row) in zip(bars, cluster_stats.iterrows()):
+    axes[1].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.001,
+                  f'n={int(row["n_tracts"])}', ha='center', fontsize=9)
+plt.tight_layout(); plt.show()
+
+print('\\nCluster Centers (original scale):')
+print(centers.round(1).to_string())""")
+
+# ═══════════════════════════════════════════════════════════════
+# PREPARE MODELING DATA
+# ═══════════════════════════════════════════════════════════════
 add("code", """# ── Prepare modeling data ──
-# Use 2017+ because lagged features require 2 prior years (2015 base -> 2016 growth -> 2017 lag)
 df_model = df[df['year'] >= 2017].copy().replace([np.inf, -np.inf], np.nan)
 q_lo, q_hi = df_model['rent_growth'].quantile(0.01), df_model['rent_growth'].quantile(0.99)
 df_model = df_model[(df_model['rent_growth'] >= q_lo) & (df_model['rent_growth'] <= q_hi)]
@@ -328,24 +446,26 @@ FEATURE_COLS = [
     'home_value_growth', 'housing_unit_growth',
     # Macro
     'mortgage_rate', 'mortgage_rate_chg', 'inflation_rate',
-    # v3: Lagged
+    # Lagged
     'lagged_rent_growth', 'lagged_income_growth', 'lagged_home_value_growth',
     'rent_growth_momentum',
-    # v3: Spatial
-    'spatial_lag_rg',
-    # v3: Relative
+    # v4: True spatial lag
+    'spatial_lag_queen', 'spatial_lag_county',
+    # Relative
     'income_vs_cbsa', 'rent_vs_cbsa', 'home_value_vs_cbsa',
-    # v3: Interactions
+    # Interactions
     'pop_growth_x_vacancy', 'income_growth_x_pct_renter', 'supply_demand_ratio',
     # Controls
     'covid_2020', 'covid_2021',
     'cbsa_Boston', 'cbsa_Dallas-Fort Worth', 'cbsa_Denver', 'cbsa_San Francisco',
-]
-TARGET = 'rent_growth'
+] + CLUSTER_COLS  # v4: cluster dummies
 
-df_clean = df_model[FEATURE_COLS + [TARGET, 'cbsa', 'year', 'GEOID', 'nominal_rent_growth', 'county_fips', 'cbsa_avg_rg']].dropna(subset=FEATURE_COLS + [TARGET])
+TARGET = 'rent_growth'
+keep_cols = FEATURE_COLS + [TARGET, 'cbsa', 'year', 'GEOID', 'nominal_rent_growth', 'county_fips', 'cbsa_avg_rg', 'cluster']
+df_clean = df_model[[c for c in keep_cols if c in df_model.columns]].dropna(subset=FEATURE_COLS + [TARGET])
+
 print(f'Model-ready data: {df_clean.shape}')
-print(f'Features: {len(FEATURE_COLS)}')
+print(f'Features: {len(FEATURE_COLS)} (incl. {len(CLUSTER_COLS)} cluster dummies)')
 print(f'Years: {sorted(df_clean["year"].unique())}')
 print(df_clean['cbsa'].value_counts())""")
 
@@ -361,27 +481,22 @@ ax.set_title('Missing Data Heatmap (Pre-dropna)')
 plt.tight_layout(); plt.show()""")
 
 add("code", """# Correlation with rent growth
-cont = [f for f in FEATURE_COLS if not f.startswith('cbsa_') and not f.startswith('covid_')]
+cont = [f for f in FEATURE_COLS if not f.startswith('cbsa_') and not f.startswith('covid_') and not f.startswith('cluster')]
 corr_t = df_clean[cont + [TARGET]].corr()[TARGET].drop(TARGET).sort_values()
 fig, ax = plt.subplots(figsize=(10, 12))
 colors = ['#d32f2f' if v < 0 else '#1976d2' for v in corr_t]
 corr_t.plot(kind='barh', ax=ax, color=colors)
 ax.set_xlabel('Correlation with Real Rent Growth')
-ax.set_title('Feature Correlations (v3 features highlighted)')
+ax.set_title('Feature Correlations with Real Rent Growth')
 ax.axvline(x=0, color='black', lw=0.5)
-# Highlight v3 features
-v3_feats = {'lagged_rent_growth','lagged_income_growth','lagged_home_value_growth',
-            'rent_growth_momentum','spatial_lag_rg','income_vs_cbsa','rent_vs_cbsa',
-            'home_value_vs_cbsa','pop_growth_x_vacancy','income_growth_x_pct_renter',
-            'supply_demand_ratio','housing_unit_growth'}
+v4_feats = {'spatial_lag_queen','spatial_lag_county'}
 for i, label in enumerate(corr_t.index):
-    if label in v3_feats:
+    if label in v4_feats:
         ax.get_children()[i].set_edgecolor('gold')
-        ax.get_children()[i].set_linewidth(2)
+        ax.get_children()[i].set_linewidth(2.5)
 plt.tight_layout(); plt.show()
-print('Gold-outlined bars = new v3 features')
-print(f'\\nTop 5 positive: {corr_t.tail(5).to_dict()}')
-print(f'Top 5 negative: {corr_t.head(5).to_dict()}')""")
+print(f'Top 5 positive: {corr_t.tail(5).round(3).to_dict()}')
+print(f'Top 5 negative: {corr_t.head(5).round(3).to_dict()}')""")
 
 add("code", """# Correlation matrix - top features
 top_f = corr_t.abs().nlargest(12).index.tolist()
@@ -401,11 +516,9 @@ axes[0].fill_between(ys['year'], ys['nom'], ys['real'], alpha=0.15, color='gray'
 axes[0].axhline(y=0, color='black', lw=0.5, ls='--')
 axes[0].set_xlabel('Year'); axes[0].set_ylabel('Median Rent Growth')
 axes[0].set_title('Real vs Nominal'); axes[0].legend(fontsize=9)
-
 df_clean.boxplot(column=TARGET, by='year', ax=axes[1])
 axes[1].set_xlabel('Year'); axes[1].set_ylabel('Real Rent Growth')
 axes[1].set_title('Distribution by Year'); plt.suptitle('')
-
 axes[2].hist(df_clean[TARGET], bins=80, color='#1976d2', alpha=0.7, edgecolor='white')
 axes[2].axvline(x=0, color='red', lw=1, ls='--')
 axes[2].axvline(x=df_clean[TARGET].mean(), color='green', lw=1.5, label=f'Mean={df_clean[TARGET].mean():.3f}')
@@ -422,22 +535,20 @@ axes[1].set_ylabel('Median Real Rent Growth'); axes[1].set_title('Over Time')
 axes[1].axhline(y=0, color='black', lw=0.5, ls='--'); axes[1].legend(fontsize=9)
 plt.tight_layout(); plt.show()""")
 
-add("code", """# Lagged rent growth scatter - key new feature
-fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+add("code", """# Spatial lag comparison: queen vs county
+fig, axes = plt.subplots(1, 2, figsize=(16, 5))
 for ax, (feat, label) in zip(axes, [
-    ('lagged_rent_growth', 'Lagged Rent Growth (t-1)'),
-    ('spatial_lag_rg', 'Spatial Lag (County Avg)'),
-    ('rent_growth_momentum', '2-Year Momentum'),
+    ('spatial_lag_queen', 'Queen Contiguity (True Neighbors)'),
+    ('spatial_lag_county', 'County Average (Proxy)'),
 ]):
     for cbsa in df_clean['cbsa'].unique():
         mask = df_clean['cbsa'] == cbsa
-        ax.scatter(df_clean.loc[mask, feat], df_clean.loc[mask, TARGET], alpha=0.1, s=5, label=cbsa)
-    ax.set_xlabel(label); ax.set_ylabel('Real Rent Growth')
+        ax.scatter(df_clean.loc[mask, feat], df_clean.loc[mask, TARGET], alpha=0.08, s=4, label=cbsa)
     r = df_clean[feat].corr(df_clean[TARGET])
+    ax.set_xlabel(f'Spatial Lag: {label}'); ax.set_ylabel('Real Rent Growth')
     ax.set_title(f'{label}\\nr = {r:.3f}')
-    ax.plot([df_clean[feat].min(), df_clean[feat].max()],
-            [df_clean[feat].min(), df_clean[feat].max()], 'r--', lw=1, alpha=0.5)
-axes[2].legend(fontsize=7, markerscale=3)
+    ax.plot(ax.get_xlim(), ax.get_xlim(), 'r--', lw=1, alpha=0.5)
+axes[1].legend(fontsize=7, markerscale=3)
 plt.tight_layout(); plt.show()""")
 
 # ═══════════════════════════════════════════════════════════════
@@ -446,17 +557,18 @@ plt.tight_layout(); plt.show()""")
 add("markdown", """---
 ## 4. Modeling
 
-### Model Suite
+### Model Suite (v4)
 | Model | Type | Purpose |
 |-------|------|---------|
-| OLS | Linear | Interpretable coefficients, significance testing |
-| Lasso | Linear + L1 | Feature selection via regularization |
-| Random Forest | Ensemble | Non-linear importance, robust baseline |
-| XGBoost | Gradient Boosted | Strong tabular performance |
-| LightGBM | Gradient Boosted | Fast, native categoricals, often best on tabular |
-| CatBoost | Gradient Boosted | Handles categoricals, ordered boosting |
-| Panel FE | Fixed Effects | Controls for tract-level unobserved heterogeneity |
-| Two-Stage | Decomposition | Separates macro vs local drivers |""")
+| OLS | Linear | Interpretable coefficients |
+| Lasso | Linear + L1 | Feature selection |
+| Random Forest | Ensemble | Non-linear baseline |
+| XGBoost | Gradient Boosted | Strong tabular performer |
+| LightGBM | Gradient Boosted | Often best on tabular |
+| CatBoost | Gradient Boosted | Ordered boosting |
+| **Stacked Ensemble** | **Meta-learner** | **Combines top models via Ridge** |
+| Panel FE | Fixed Effects | Within-tract variation |
+| Two-Stage | Decomposition | Macro vs local separation |""")
 
 add("code", """# Train/test split
 X = df_clean[FEATURE_COLS].values
@@ -468,32 +580,20 @@ X_train, X_test, y_train, y_test, idx_train, idx_test = train_test_split(
 scaler = StandardScaler()
 X_tr_s = scaler.fit_transform(X_train)
 X_te_s = scaler.transform(X_test)
-
-# Also create temporal split for robustness check
-temporal_mask = df_clean['year'] <= 2021
-X_temp_train = df_clean.loc[temporal_mask, FEATURE_COLS].values
-y_temp_train = df_clean.loc[temporal_mask, TARGET].values
-X_temp_test = df_clean.loc[~temporal_mask, FEATURE_COLS].values
-y_temp_test = df_clean.loc[~temporal_mask, TARGET].values
-
-print(f'Random split  - Train: {X_train.shape[0]:,}  Test: {X_test.shape[0]:,}  Features: {X_train.shape[1]}')
-print(f'Temporal split - Train (<=2021): {X_temp_train.shape[0]:,}  Test (2022-23): {X_temp_test.shape[0]:,}')""")
+print(f'Random split - Train: {X_train.shape[0]:,}  Test: {X_test.shape[0]:,}  Features: {X_train.shape[1]}')""")
 
 # ── OLS ──
 add("code", """# === OLS ===
-X_tr_ols = sm.add_constant(X_tr_s)
-X_te_ols = sm.add_constant(X_te_s)
+X_tr_ols = sm.add_constant(X_tr_s, has_constant='add')
+X_te_ols = sm.add_constant(X_te_s, has_constant='add')
 ols_model = sm.OLS(y_train, X_tr_ols).fit()
 y_ols_tr = ols_model.predict(X_tr_ols)
 y_ols_te = ols_model.predict(X_te_ols)
-print(f'=== OLS === Train R2: {ols_model.rsquared:.4f} | Test R2: {r2_score(y_test, y_ols_te):.4f} | Adj R2: {ols_model.rsquared_adj:.4f}')
-
-# Significant features
 ols_df = pd.DataFrame({'Feature': ['const']+FEATURE_COLS, 'Coef': ols_model.params,
     'P': ols_model.pvalues}).set_index('Feature')
-sig = ols_df[(ols_df['P'] < 0.05) & (ols_df.index != 'const')].sort_values('Coef', key=abs, ascending=False)
-print(f'\\nSignificant features (p<0.05): {len(sig)}/{len(FEATURE_COLS)}')
-print(sig[['Coef','P']].head(15).to_string())""")
+print(f'=== OLS === Train R2: {ols_model.rsquared:.4f} | Test R2: {r2_score(y_test, y_ols_te):.4f}')
+sig = ols_df[(ols_df['P']<0.05)&(ols_df.index!='const')].sort_values('Coef',key=abs,ascending=False)
+print(f'Significant (p<0.05): {len(sig)}/{len(FEATURE_COLS)}')""")
 
 # ── Lasso ──
 add("code", """# === Lasso ===
@@ -503,11 +603,9 @@ y_las_tr = lasso_cv.predict(X_tr_s)
 y_las_te = lasso_cv.predict(X_te_s)
 lasso_coefs = pd.Series(lasso_cv.coef_, index=FEATURE_COLS)
 print(f'=== Lasso === Alpha: {lasso_cv.alpha_:.6f} | Train: {r2_score(y_train,y_las_tr):.4f} | Test: {r2_score(y_test,y_las_te):.4f}')
-print(f'Non-zero: {(lasso_coefs!=0).sum()}/{len(lasso_coefs)}')
-print('\\nRetained features:')
-print(lasso_coefs[lasso_coefs!=0].sort_values(key=abs, ascending=False).to_string())""")
+print(f'Non-zero: {(lasso_coefs!=0).sum()}/{len(lasso_coefs)}')""")
 
-# ── Random Forest ──
+# ── RF ──
 add("code", """# === Random Forest ===
 rf_model = RandomForestRegressor(n_estimators=500, max_depth=15, min_samples_leaf=20, random_state=42, n_jobs=-1)
 rf_model.fit(X_train, y_train)
@@ -550,83 +648,93 @@ cat_model = CatBoostRegressor(
 cat_model.fit(X_train, y_train, eval_set=(X_test, y_test), verbose=0)
 y_cat_tr = cat_model.predict(X_train)
 y_cat_te = cat_model.predict(X_test)
-print(f'=== CatBoost === Train: {r2_score(y_train,y_cat_tr):.4f} | Test: {r2_score(y_test,y_cat_te):.4f}')
-print(f'Best iteration: {cat_model.best_iteration_}')""")
+print(f'=== CatBoost === Train: {r2_score(y_train,y_cat_tr):.4f} | Test: {r2_score(y_test,y_cat_te):.4f}')""")
+
+# ═══════════════════════════════════════════════════════════════
+# NEW v4: STACKING ENSEMBLE
+# ═══════════════════════════════════════════════════════════════
+add("markdown", """### Stacked Ensemble (v4)
+Combines predictions from LightGBM, XGBoost, CatBoost, and Random Forest using a **Ridge regression meta-learner**.
+Base models generate out-of-fold predictions via 5-fold CV to avoid leakage.""")
+
+add("code", """# === Stacked Ensemble ===
+stack_model = StackingRegressor(
+    estimators=[
+        ('lgb', lgb.LGBMRegressor(n_estimators=500, max_depth=8, learning_rate=0.03,
+            num_leaves=63, subsample=0.8, colsample_bytree=0.8, min_child_samples=30,
+            random_state=42, n_jobs=-1, verbose=-1)),
+        ('xgb', xgb.XGBRegressor(n_estimators=500, max_depth=6, learning_rate=0.05,
+            subsample=0.8, colsample_bytree=0.8, random_state=42, n_jobs=-1)),
+        ('cat', CatBoostRegressor(iterations=500, depth=8, learning_rate=0.03,
+            l2_leaf_reg=3.0, random_seed=42, verbose=0)),
+        ('rf', RandomForestRegressor(n_estimators=300, max_depth=15,
+            min_samples_leaf=20, random_state=42, n_jobs=-1)),
+    ],
+    final_estimator=Ridge(alpha=1.0),
+    cv=5, n_jobs=-1,
+)
+print('Fitting stacked ensemble (5-fold CV for base models)...')
+stack_model.fit(X_train, y_train)
+y_stack_tr = stack_model.predict(X_train)
+y_stack_te = stack_model.predict(X_test)
+print(f'=== Stacked Ensemble === Train: {r2_score(y_train,y_stack_tr):.4f} | Test: {r2_score(y_test,y_stack_te):.4f}')
+
+# Show meta-learner weights
+meta_coefs = pd.Series(stack_model.final_estimator_.coef_,
+                         index=['LightGBM','XGBoost','CatBoost','RF'])
+print(f'\\nMeta-learner weights:')
+print(meta_coefs.round(4).to_string())""")
 
 # ── Panel FE ──
-add("markdown", """### Panel Fixed Effects
-Controls for **time-invariant tract characteristics** (location quality, school district, proximity to transit, etc.)
-that we can't observe directly. The within-estimator answers: *"When a tract's features change over time,
-how does its rent growth respond?"*""")
+add("markdown", """### Panel Fixed Effects""")
 
-add("code", """# === Panel Fixed Effects (linearmodels) ===
+add("code", """# === Panel FE ===
 panel_df = df_clean.set_index(['GEOID', 'year'])
-# Remove features that don't vary within tract (CBSA dummies)
-panel_features = [f for f in FEATURE_COLS if not f.startswith('cbsa_')]
-
+panel_features = [f for f in FEATURE_COLS if not f.startswith('cbsa_') and not f.startswith('cluster')]
 panel_mod = PanelOLS(panel_df[TARGET], panel_df[panel_features], entity_effects=True, drop_absorbed=True)
 panel_res = panel_mod.fit(cov_type='clustered', cluster_entity=True)
 print(f'=== Panel FE === Within R2: {panel_res.rsquared_within:.4f} | Overall R2: {panel_res.rsquared_overall:.4f}')
-print(f'Entities (tracts): {panel_res.entity_info.total}')
-print(f'\\nTop significant coefficients:')
-panel_summary = pd.DataFrame({
-    'Coef': panel_res.params,
-    'P': panel_res.pvalues
-})
-panel_sig = panel_summary[panel_summary['P'] < 0.05].sort_values('Coef', key=abs, ascending=False)
-print(panel_sig.head(15).to_string())""")
+print(f'Entities: {panel_res.entity_info.total}')
+panel_summary = pd.DataFrame({'Coef': panel_res.params, 'P': panel_res.pvalues})
+panel_sig = panel_summary[panel_summary['P']<0.05].sort_values('Coef',key=abs,ascending=False)
+print(f'\\nTop significant:')
+print(panel_sig.head(12).to_string())""")
 
 # ── Two-Stage ──
-add("markdown", """### Two-Stage Decomposition
-Separates **macro drivers** (what moves entire markets) from **local drivers** (what makes individual tracts different).
-- **Stage 1:** Predict CBSA-year average rent growth from macro variables
-- **Stage 2:** Predict tract deviation from CBSA average using local features
-- **Combined:** Stage 1 + Stage 2 = full prediction""")
+add("markdown", """### Two-Stage Decomposition""")
 
 add("code", """# === Two-Stage Model ===
 df_train_2s = df_clean.loc[idx_train].copy()
 df_test_2s = df_clean.loc[idx_test].copy()
 
-# Stage 1: CBSA-year average from macro
 cbsa_year_train = df_train_2s.groupby(['cbsa', 'year']).agg(
-    cbsa_rg=(TARGET, 'mean'),
-    mortgage_rate=('mortgage_rate', 'first'),
-    inflation_rate=('inflation_rate', 'first'),
-    mortgage_rate_chg=('mortgage_rate_chg', 'first'),
-    covid_2020=('covid_2020', 'first'),
-    covid_2021=('covid_2021', 'first'),
+    cbsa_rg=(TARGET, 'mean'), mortgage_rate=('mortgage_rate', 'first'),
+    inflation_rate=('inflation_rate', 'first'), mortgage_rate_chg=('mortgage_rate_chg', 'first'),
+    covid_2020=('covid_2020', 'first'), covid_2021=('covid_2021', 'first'),
 ).reset_index()
 cbsa_dum_s1 = pd.get_dummies(cbsa_year_train['cbsa'], prefix='cbsa', dtype=int).drop(columns='cbsa_Los Angeles')
 stage1_X = pd.concat([cbsa_year_train[['mortgage_rate','inflation_rate','mortgage_rate_chg','covid_2020','covid_2021']], cbsa_dum_s1], axis=1)
-stage1_y = cbsa_year_train['cbsa_rg']
-stage1_model = sm.OLS(stage1_y, sm.add_constant(stage1_X)).fit()
-print(f'Stage 1 (macro -> CBSA avg): R2 = {stage1_model.rsquared:.4f}, n = {len(stage1_y)}')
-print(stage1_model.summary().tables[1])
+stage1_model = sm.OLS(cbsa_year_train['cbsa_rg'], sm.add_constant(stage1_X)).fit()
+print(f'Stage 1 R2: {stage1_model.rsquared:.4f} (n={len(cbsa_year_train)})')
 
-# Stage 1 predictions for test
 cbsa_year_test = df_test_2s[['cbsa','year','mortgage_rate','inflation_rate','mortgage_rate_chg','covid_2020','covid_2021']].drop_duplicates()
 cbsa_dum_s1_te = pd.get_dummies(cbsa_year_test['cbsa'], prefix='cbsa', dtype=int).drop(columns='cbsa_Los Angeles')
 stage1_X_te = pd.concat([cbsa_year_test[['mortgage_rate','inflation_rate','mortgage_rate_chg','covid_2020','covid_2021']].reset_index(drop=True), cbsa_dum_s1_te.reset_index(drop=True)], axis=1)
 cbsa_year_test = cbsa_year_test.reset_index(drop=True)
 cbsa_year_test['stage1_pred'] = stage1_model.predict(sm.add_constant(stage1_X_te))
 
-# Stage 2: Local deviation
 train_cbsa_means = df_train_2s.groupby(['cbsa','year'])[TARGET].transform('mean')
 df_train_2s['deviation'] = df_train_2s[TARGET] - train_cbsa_means
 local_features = [f for f in FEATURE_COLS if f not in ['mortgage_rate','inflation_rate','mortgage_rate_chg','covid_2020','covid_2021'] and not f.startswith('cbsa_')]
 stage2_model = lgb.LGBMRegressor(n_estimators=500, max_depth=6, learning_rate=0.03, verbose=-1, n_jobs=-1, random_state=42)
 stage2_model.fit(df_train_2s[local_features].values, df_train_2s['deviation'].values)
-print(f'\\nStage 2 (local -> deviation): Train R2 = {r2_score(df_train_2s["deviation"], stage2_model.predict(df_train_2s[local_features].values)):.4f}')
 
-# Combined prediction on test
 df_test_2s = df_test_2s.merge(cbsa_year_test[['cbsa','year','stage1_pred']], on=['cbsa','year'], how='left')
 df_test_2s['stage2_pred'] = stage2_model.predict(df_test_2s[local_features].values)
 df_test_2s['combined_pred'] = df_test_2s['stage1_pred'] + df_test_2s['stage2_pred']
 y_2s_te = df_test_2s['combined_pred'].values
 y_2s_actual = df_test_2s[TARGET].values
-
-print(f'\\n=== Two-Stage Combined === Test R2: {r2_score(y_2s_actual, y_2s_te):.4f}')
-print(f'  Stage 1 alone Test R2: {r2_score(y_2s_actual, df_test_2s["stage1_pred"].values):.4f}')""")
+print(f'=== Two-Stage === Test R2: {r2_score(y_2s_actual, y_2s_te):.4f}')""")
 
 # ═══════════════════════════════════════════════════════════════
 # SECTION 6: RESULTS
@@ -635,69 +743,102 @@ add("markdown", "---\\n## 5. Results & Comparison")
 
 add("code", """# Model comparison
 results = pd.DataFrame({
-    'Model': ['OLS', 'Lasso', 'Random Forest', 'XGBoost', 'LightGBM', 'CatBoost', 'Two-Stage'],
+    'Model': ['OLS', 'Lasso', 'Random Forest', 'XGBoost', 'LightGBM', 'CatBoost',
+              'Stacked Ensemble', 'Two-Stage'],
     'Train R2': [
         r2_score(y_train, y_ols_tr), r2_score(y_train, y_las_tr),
         r2_score(y_train, y_rf_tr), r2_score(y_train, y_xgb_tr),
         r2_score(y_train, y_lgb_tr), r2_score(y_train, y_cat_tr),
-        np.nan,  # two-stage train not directly comparable
+        r2_score(y_train, y_stack_tr), np.nan,
     ],
     'Test R2': [
         r2_score(y_test, y_ols_te), r2_score(y_test, y_las_te),
         r2_score(y_test, y_rf_te), r2_score(y_test, y_xgb_te),
         r2_score(y_test, y_lgb_te), r2_score(y_test, y_cat_te),
-        r2_score(y_2s_actual, y_2s_te),
+        r2_score(y_test, y_stack_te), r2_score(y_2s_actual, y_2s_te),
     ],
     'Test MAE': [
         mean_absolute_error(y_test, y_ols_te), mean_absolute_error(y_test, y_las_te),
         mean_absolute_error(y_test, y_rf_te), mean_absolute_error(y_test, y_xgb_te),
         mean_absolute_error(y_test, y_lgb_te), mean_absolute_error(y_test, y_cat_te),
-        mean_absolute_error(y_2s_actual, y_2s_te),
+        mean_absolute_error(y_test, y_stack_te), mean_absolute_error(y_2s_actual, y_2s_te),
     ],
 })
 
-fig, ax = plt.subplots(figsize=(12, 6))
+fig, ax = plt.subplots(figsize=(14, 6))
 x = np.arange(len(results))
 w = 0.35
 b1 = ax.bar(x - w/2, results['Train R2'].fillna(0), w, label='Train', color='#1976d2', alpha=0.8)
 b2 = ax.bar(x + w/2, results['Test R2'], w, label='Test', color='#d32f2f', alpha=0.8)
-ax.set_ylabel('R-squared'); ax.set_title('Model Performance Comparison (v3)')
-ax.set_xticks(x); ax.set_xticklabels(results['Model'], rotation=30, ha='right')
+ax.set_ylabel('R-squared'); ax.set_title('Model Performance Comparison (v4)')
+ax.set_xticks(x); ax.set_xticklabels(results['Model'], rotation=35, ha='right')
 ax.legend()
-for bar in b1:
-    if bar.get_height() > 0:
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.005, f'{bar.get_height():.3f}', ha='center', fontsize=8)
 for bar in b2:
-    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.005, f'{bar.get_height():.3f}', ha='center', fontsize=8)
+    ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.005, f'{bar.get_height():.3f}', ha='center', fontsize=8)
 plt.tight_layout(); plt.show()
 print(results.to_string(index=False))""")
 
-add("code", """# Temporal split robustness check
-print('=== Temporal Split Robustness (Train <=2021, Test 2022-23) ===')
-scaler_t = StandardScaler()
-X_tt_s = scaler_t.fit_transform(X_temp_train)
-X_ttest_s = scaler_t.transform(X_temp_test)
+# ═══════════════════════════════════════════════════════════════
+# NEW v4: TIME-SERIES CROSS-VALIDATION
+# ═══════════════════════════════════════════════════════════════
+add("markdown", """### Expanding-Window Time-Series Cross-Validation (v4)
+Train on all data up to year *t*, predict year *t+1*. This tests whether the model
+generalizes **forward in time** — the realistic deployment scenario.""")
 
-temporal_results = {}
-for name, model_class, kwargs, use_scaled in [
-    ('OLS', None, {}, True),
-    ('LightGBM', lgb.LGBMRegressor, dict(n_estimators=500, max_depth=8, learning_rate=0.03, verbose=-1, n_jobs=-1, random_state=42), False),
-    ('XGBoost', xgb.XGBRegressor, dict(n_estimators=500, max_depth=6, learning_rate=0.05, random_state=42, n_jobs=-1), False),
-]:
-    if name == 'OLS':
-        m = sm.OLS(y_temp_train, sm.add_constant(X_tt_s, has_constant='add')).fit()
-        pred = m.predict(sm.add_constant(X_ttest_s, has_constant='add'))
-    else:
-        m = model_class(**kwargs)
-        m.fit(X_temp_train, y_temp_train)
-        pred = m.predict(X_temp_test)
-    r2 = r2_score(y_temp_test, pred)
-    temporal_results[name] = r2
-    print(f'  {name}: Test R2 = {r2:.4f}')
-print('\\nNote: temporal split is harder (predicting into a different macro regime)')""")
+add("code", """# TSCV: expanding window
+tscv_years = sorted(df_clean['year'].unique())
+tscv_results = []
+
+for i in range(1, len(tscv_years)):
+    train_yrs = tscv_years[:i]
+    test_yr = tscv_years[i]
+    tr_mask = df_clean['year'].isin(train_yrs)
+    te_mask = df_clean['year'] == test_yr
+
+    X_tr_cv = df_clean.loc[tr_mask, FEATURE_COLS].values
+    y_tr_cv = df_clean.loc[tr_mask, TARGET].values
+    X_te_cv = df_clean.loc[te_mask, FEATURE_COLS].values
+    y_te_cv = df_clean.loc[te_mask, TARGET].values
+
+    if len(y_te_cv) == 0:
+        continue
+
+    m = lgb.LGBMRegressor(n_estimators=500, max_depth=8, learning_rate=0.03,
+        num_leaves=63, min_child_samples=30, random_state=42, n_jobs=-1, verbose=-1)
+    m.fit(X_tr_cv, y_tr_cv)
+    pred = m.predict(X_te_cv)
+    r2 = r2_score(y_te_cv, pred)
+    mae = mean_absolute_error(y_te_cv, pred)
+    tscv_results.append({
+        'train_years': f'{train_yrs[0]}-{train_yrs[-1]}',
+        'test_year': test_yr,
+        'n_train': len(y_tr_cv),
+        'n_test': len(y_te_cv),
+        'R2': r2,
+        'MAE': mae,
+    })
+
+tscv_df = pd.DataFrame(tscv_results)
+fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+
+axes[0].bar(tscv_df['test_year'].astype(str), tscv_df['R2'],
+            color=['#d32f2f' if r < 0 else '#1976d2' for r in tscv_df['R2']], alpha=0.8)
+axes[0].set_xlabel('Test Year'); axes[0].set_ylabel('R-squared')
+axes[0].set_title('LightGBM: Expanding-Window TSCV')
+axes[0].axhline(y=0, color='black', lw=0.5, ls='--')
+for _, row in tscv_df.iterrows():
+    axes[0].text(str(int(row['test_year'])), row['R2'] + 0.01 * (1 if row['R2'] >= 0 else -1),
+                  f'{row["R2"]:.3f}', ha='center', fontsize=9)
+
+axes[1].bar(tscv_df['test_year'].astype(str), tscv_df['MAE'], color='#e65100', alpha=0.8)
+axes[1].set_xlabel('Test Year'); axes[1].set_ylabel('MAE'); axes[1].set_title('MAE by Test Year')
+
+plt.tight_layout(); plt.show()
+print(tscv_df.to_string(index=False))
+print(f'\\nAvg TSCV R2: {tscv_df["R2"].mean():.4f}  |  Avg MAE: {tscv_df["MAE"].mean():.4f}')""")
 
 # ── Feature importance ──
-add("code", """# Feature importance comparison (4 tree models)
+add("code", """# Feature importance comparison
 rf_imp = pd.Series(rf_model.feature_importances_, index=FEATURE_COLS)
 xgb_imp = pd.Series(xgb_model.feature_importances_, index=FEATURE_COLS)
 lgb_imp = pd.Series(lgb_model.feature_importances_, index=FEATURE_COLS)
@@ -705,40 +846,27 @@ cat_imp = pd.Series(cat_model.feature_importances_, index=FEATURE_COLS)
 
 fig, axes = plt.subplots(2, 2, figsize=(20, 18))
 for ax, (imp, name, color) in zip(axes.flat, [
-    (rf_imp, 'Random Forest', '#2e7d32'),
-    (xgb_imp, 'XGBoost', '#e65100'),
-    (lgb_imp, 'LightGBM', '#1565c0'),
-    (cat_imp, 'CatBoost', '#6a1b9a'),
+    (rf_imp, 'Random Forest', '#2e7d32'), (xgb_imp, 'XGBoost', '#e65100'),
+    (lgb_imp, 'LightGBM', '#1565c0'), (cat_imp, 'CatBoost', '#6a1b9a'),
 ]):
     sorted_imp = imp.sort_values()
-    bars = sorted_imp.plot(kind='barh', ax=ax, color=color, alpha=0.8)
-    ax.set_title(f'{name} Feature Importance')
-    ax.set_xlabel('Importance')
-    # Highlight top 5
-    for i, (idx, val) in enumerate(sorted_imp.items()):
-        if i >= len(sorted_imp) - 5:
-            ax.get_children()[i].set_edgecolor('red')
-            ax.get_children()[i].set_linewidth(1.5)
-plt.suptitle('Feature Importance Across Tree Models (top 5 outlined in red)', fontsize=14, y=1.01)
+    sorted_imp.plot(kind='barh', ax=ax, color=color, alpha=0.8)
+    ax.set_title(f'{name} Feature Importance'); ax.set_xlabel('Importance')
+plt.suptitle('Feature Importance Across Tree Models', fontsize=14, y=1.01)
 plt.tight_layout(); plt.show()""")
 
 add("code", """# Consensus feature importance
 importance_df = pd.DataFrame({
     'RF': rf_imp, 'XGB': xgb_imp, 'LightGBM': lgb_imp, 'CatBoost': cat_imp,
     'OLS |coef|': ols_df.loc[FEATURE_COLS, 'Coef'].abs().values,
-    'OLS p': ols_df.loc[FEATURE_COLS, 'P'].values,
     'Lasso': lasso_coefs.values,
 }, index=FEATURE_COLS)
-
-# Rank each feature across tree models
 for col in ['RF','XGB','LightGBM','CatBoost']:
     importance_df[f'{col}_rank'] = importance_df[col].rank(ascending=False)
 importance_df['Avg_tree_rank'] = importance_df[['RF_rank','XGB_rank','LightGBM_rank','CatBoost_rank']].mean(axis=1)
 importance_df = importance_df.sort_values('Avg_tree_rank')
-
-print('=== Consensus Feature Importance (sorted by avg tree rank) ===')
-display_cols = ['OLS |coef|', 'OLS p', 'Lasso', 'RF', 'XGB', 'LightGBM', 'CatBoost', 'Avg_tree_rank']
-print(importance_df[display_cols].round(4).to_string())""")
+print('=== Consensus Feature Importance ===')
+print(importance_df[['OLS |coef|','Lasso','RF','XGB','LightGBM','CatBoost','Avg_tree_rank']].round(4).head(20).to_string())""")
 
 add("code", """# Normalized importance heatmap
 norm_imp = pd.DataFrame({
@@ -749,56 +877,26 @@ norm_imp = pd.DataFrame({
     'LightGBM': importance_df['LightGBM'] / importance_df['LightGBM'].max(),
     'CatBoost': importance_df['CatBoost'] / importance_df['CatBoost'].max(),
 }, index=importance_df.index)
-
-fig, ax = plt.subplots(figsize=(10, 14))
+fig, ax = plt.subplots(figsize=(10, 16))
 sns.heatmap(norm_imp, annot=True, fmt='.2f', cmap='YlOrRd', ax=ax, vmin=0, vmax=1)
 ax.set_title('Normalized Feature Importance Across All Models')
 plt.tight_layout(); plt.show()""")
 
-# ── Lasso path ──
-add("code", """# Lasso regularization path
-alphas = np.logspace(-6, -1, 200)
-coef_paths = []
-for a in alphas:
-    lt = Lasso(alpha=a, max_iter=10000)
-    lt.fit(X_tr_s, y_train)
-    coef_paths.append(lt.coef_)
-coef_paths = np.array(coef_paths)
-
-fig, ax = plt.subplots(figsize=(14, 8))
-# Only label top features
-top_lasso = lasso_coefs.abs().nlargest(10).index
-for i, f in enumerate(FEATURE_COLS):
-    lw = 2 if f in top_lasso.values else 0.5
-    alpha = 1.0 if f in top_lasso.values else 0.3
-    line, = ax.plot(alphas, coef_paths[:, i], lw=lw, alpha=alpha)
-    if f in top_lasso.values:
-        line.set_label(f)
-ax.set_xscale('log'); ax.set_xlabel('Alpha (regularization strength)')
-ax.set_ylabel('Coefficient')
-ax.set_title('Lasso Coefficient Path')
-ax.axvline(x=lasso_cv.alpha_, color='black', ls='--', lw=1, label=f'CV optimal ({lasso_cv.alpha_:.5f})')
-ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=8)
-plt.tight_layout(); plt.show()""")
-
 # ── Pred vs Actual ──
-add("code", """# Predictions vs actuals - best models
+add("code", """# Predictions vs actuals
 best_preds = [
-    ('LightGBM', y_lgb_te), ('CatBoost', y_cat_te),
-    ('XGBoost', y_xgb_te), ('Random Forest', y_rf_te),
+    ('Stacked Ensemble', y_stack_te), ('LightGBM', y_lgb_te),
+    ('XGBoost', y_xgb_te), ('CatBoost', y_cat_te),
 ]
 fig, axes = plt.subplots(2, 2, figsize=(14, 12))
 for ax, (nm, yp) in zip(axes.flat, best_preds):
     ax.scatter(y_test, yp, alpha=0.08, s=5, color='#1976d2')
     lims = [min(y_test.min(), yp.min()), max(y_test.max(), yp.max())]
-    ax.plot(lims, lims, 'r-', lw=1.5, label='Perfect prediction')
-    # Add trend line
+    ax.plot(lims, lims, 'r-', lw=1.5, label='Perfect')
     z = np.polyfit(y_test, yp, 1)
     ax.plot(lims, np.poly1d(z)(lims), 'g--', lw=1, alpha=0.7, label=f'Trend (slope={z[0]:.2f})')
-    ax.set_xlabel('Actual Real Rent Growth')
-    ax.set_ylabel('Predicted')
-    ax.set_title(f'{nm} (R2={r2_score(y_test, yp):.4f})')
-    ax.legend(fontsize=8)
+    ax.set_xlabel('Actual'); ax.set_ylabel('Predicted')
+    ax.set_title(f'{nm} (R2={r2_score(y_test,yp):.4f})'); ax.legend(fontsize=8)
 plt.suptitle('Predictions vs Actuals (Test Set)', fontsize=14, y=1.01)
 plt.tight_layout(); plt.show()""")
 
@@ -806,10 +904,7 @@ plt.tight_layout(); plt.show()""")
 # SECTION 7: TRACT-LEVEL PREDICTIONS
 # ═══════════════════════════════════════════════════════════════
 add("markdown", """---
-## 6. Tract-Level Prediction Time Series
-
-Select representative tracts and compare predicted vs actual rent growth over time.
-Uses the best-performing model to generate full-sample predictions (in-sample + out-of-sample).""")
+## 6. Tract-Level Prediction Time Series""")
 
 add("code", """# Fit best model on full data for tract-level time series
 best_model = lgb.LGBMRegressor(
@@ -820,214 +915,223 @@ best_model = lgb.LGBMRegressor(
 best_model.fit(X, y)
 df_clean['predicted_rg'] = best_model.predict(X)
 
-# Select representative tracts: 2 per CBSA (highest and lowest avg rent growth)
+# Select representative tracts: 2 per CBSA
 selected_tracts = []
 for cbsa in ['Boston', 'Dallas-Fort Worth', 'San Francisco', 'Denver', 'Los Angeles']:
     cbsa_tracts = df_clean[df_clean['cbsa'] == cbsa].groupby('GEOID').agg(
-        mean_rg=(TARGET, 'mean'),
-        n_years=(TARGET, 'count'),
+        mean_rg=(TARGET, 'mean'), n_years=(TARGET, 'count'),
     )
-    # Only tracts with data for all years
     full_tracts = cbsa_tracts[cbsa_tracts['n_years'] == cbsa_tracts['n_years'].max()]
     if len(full_tracts) >= 2:
         selected_tracts.append((cbsa, full_tracts['mean_rg'].idxmax(), 'High growth'))
         selected_tracts.append((cbsa, full_tracts['mean_rg'].idxmin(), 'Low growth'))
 
-print(f'Selected {len(selected_tracts)} tracts for time series visualization:')
+print(f'Selected {len(selected_tracts)} tracts:')
 for cbsa, geoid, label in selected_tracts:
     avg = df_clean[df_clean['GEOID']==geoid][TARGET].mean()
-    print(f'  {cbsa} ({label}): {geoid}  avg real rent growth = {avg:.3f}')""")
+    cl = df_clean[df_clean['GEOID']==geoid]['cluster'].iloc[0]
+    print(f'  {cbsa} ({label}): {geoid}  avg={avg:.3f}  cluster={int(cl)}')""")
 
 add("code", """# Plot tract-level predictions vs actuals
 n_tracts = len(selected_tracts)
-n_cols = 2
-n_rows = (n_tracts + 1) // 2
-fig, axes = plt.subplots(n_rows, n_cols, figsize=(16, 4 * n_rows), sharex=True)
+fig, axes = plt.subplots((n_tracts+1)//2, 2, figsize=(16, 4*((n_tracts+1)//2)), sharex=True)
 axes = axes.flat
 
 for i, (cbsa, geoid, label) in enumerate(selected_tracts):
     ax = axes[i]
-    tract_data = df_clean[df_clean['GEOID'] == geoid].sort_values('year')
-    ax.plot(tract_data['year'], tract_data[TARGET], 'o-', color='#1976d2', lw=2, markersize=6, label='Actual')
-    ax.plot(tract_data['year'], tract_data['predicted_rg'], 's--', color='#d32f2f', lw=2, markersize=6, label='Predicted')
-    ax.fill_between(tract_data['year'], tract_data[TARGET], tract_data['predicted_rg'], alpha=0.1, color='gray')
+    td = df_clean[df_clean['GEOID'] == geoid].sort_values('year')
+    ax.plot(td['year'], td[TARGET], 'o-', color='#1976d2', lw=2, markersize=6, label='Actual')
+    ax.plot(td['year'], td['predicted_rg'], 's--', color='#d32f2f', lw=2, markersize=6, label='Predicted')
+    ax.fill_between(td['year'], td[TARGET], td['predicted_rg'], alpha=0.1, color='gray')
     ax.axhline(y=0, color='black', lw=0.5, ls=':')
     ax.set_ylabel('Real Rent Growth')
-    ax.set_title(f'{cbsa} - {label}\\nTract {geoid}', fontsize=10)
+    ax.set_title(f'{cbsa} - {label} (Tract {geoid})', fontsize=10)
     ax.legend(fontsize=8)
-    r2 = r2_score(tract_data[TARGET], tract_data['predicted_rg'])
+    r2 = r2_score(td[TARGET], td['predicted_rg'])
     ax.text(0.02, 0.02, f'R2={r2:.3f}', transform=ax.transAxes, fontsize=9,
             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
-# Remove extra axes
-for j in range(i + 1, len(axes)):
+for j in range(i+1, len(axes)):
     axes[j].set_visible(False)
-
-plt.suptitle('Tract-Level: Actual vs Predicted Real Rent Growth (LightGBM)', fontsize=14, y=1.01)
+plt.suptitle('Tract-Level: Actual vs Predicted (LightGBM)', fontsize=14, y=1.01)
 plt.tight_layout(); plt.show()""")
 
-add("code", """# Residual analysis by CBSA and year
+add("code", """# Residual analysis
 df_clean['residual'] = df_clean[TARGET] - df_clean['predicted_rg']
-
 fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-
-# Residuals by CBSA
 df_clean.boxplot(column='residual', by='cbsa', ax=axes[0])
 axes[0].set_title('Residuals by CBSA'); axes[0].set_ylabel('Residual'); plt.suptitle('')
 axes[0].tick_params(axis='x', rotation=30)
-
-# Residuals by year
 df_clean.boxplot(column='residual', by='year', ax=axes[1])
-axes[1].set_title('Residuals by Year'); axes[1].set_ylabel('Residual'); plt.suptitle('')
-
-# Residual distribution
+axes[1].set_title('Residuals by Year'); plt.suptitle('')
 axes[2].hist(df_clean['residual'], bins=80, color='#1976d2', alpha=0.7, edgecolor='white')
 axes[2].axvline(x=0, color='red', lw=1.5)
-axes[2].set_xlabel('Residual'); axes[2].set_title(f'Residual Distribution (std={df_clean["residual"].std():.4f})')
-
+axes[2].set_xlabel('Residual'); axes[2].set_title(f'Distribution (std={df_clean["residual"].std():.4f})')
 plt.tight_layout(); plt.show()""")
 
-# ── Interactive tract explorer ──
+# ── Tract explorer ──
 add("markdown", """### Tract Explorer
-Modify the `EXPLORE_GEOID` variable below to view predictions for any tract in the dataset.
-You can find tract GEOIDs from the data or look up tracts at [census.gov/cgi-bin/geo/shapefiles](https://www2.census.gov/geo/maps/dc10map/tract/).""")
+Change `EXPLORE_GEOID` below to view any tract's prediction history.""")
 
 add("code", """# ============================================================
-# TRACT EXPLORER - Change the GEOID below to explore any tract
+# TRACT EXPLORER - Change GEOID to explore any tract
 # ============================================================
-EXPLORE_GEOID = selected_tracts[0][1]  # Default: first selected tract
+EXPLORE_GEOID = selected_tracts[0][1]
 
 tract = df_clean[df_clean['GEOID'] == EXPLORE_GEOID].sort_values('year')
 if len(tract) == 0:
-    print(f'Tract {EXPLORE_GEOID} not found. Available tracts:')
-    print(df_clean['GEOID'].unique()[:20])
+    print(f'Tract {EXPLORE_GEOID} not found.')
 else:
     cbsa_name = tract['cbsa'].iloc[0]
+    cl = int(tract['cluster'].iloc[0])
     fig, axes = plt.subplots(1, 2, figsize=(16, 5))
-
-    # Rent growth time series
     axes[0].plot(tract['year'], tract[TARGET], 'o-', color='#1976d2', lw=2.5, markersize=8, label='Actual')
-    axes[0].plot(tract['year'], tract['predicted_rg'], 's--', color='#d32f2f', lw=2.5, markersize=8, label='Predicted (LightGBM)')
+    axes[0].plot(tract['year'], tract['predicted_rg'], 's--', color='#d32f2f', lw=2.5, markersize=8, label='Predicted')
     axes[0].fill_between(tract['year'], tract[TARGET], tract['predicted_rg'], alpha=0.1, color='gray')
     axes[0].axhline(y=0, color='black', lw=0.5, ls=':')
     axes[0].set_xlabel('Year'); axes[0].set_ylabel('Real Rent Growth')
-    axes[0].set_title(f'Tract {EXPLORE_GEOID} ({cbsa_name})')
+    axes[0].set_title(f'Tract {EXPLORE_GEOID} ({cbsa_name}, Cluster {cl})')
     axes[0].legend()
-
-    # Feature values for this tract (latest year)
     latest = tract.iloc[-1]
     top_features = importance_df.head(10).index
     feat_vals = latest[top_features]
     axes[1].barh(range(len(feat_vals)), feat_vals.values, color='#1976d2', alpha=0.8)
     axes[1].set_yticks(range(len(feat_vals)))
     axes[1].set_yticklabels(top_features, fontsize=9)
-    axes[1].set_title(f'Top 10 Feature Values ({int(latest["year"])})')
-    axes[1].set_xlabel('Value')
-
+    axes[1].set_title(f'Top Feature Values ({int(latest["year"])})')
     plt.tight_layout(); plt.show()
+    print(f'Tract {EXPLORE_GEOID} ({cbsa_name}, Cluster {cl})')
+    print(f'  Avg rent growth: {tract[TARGET].mean():.4f}  |  Predicted: {tract["predicted_rg"].mean():.4f}')
+    print(f'  R2: {r2_score(tract[TARGET], tract["predicted_rg"]):.4f}')""")
 
-    # Summary stats
-    print(f'\\nTract {EXPLORE_GEOID} ({cbsa_name})')
-    print(f'  Years: {tract["year"].min()}-{tract["year"].max()} ({len(tract)} obs)')
-    print(f'  Avg real rent growth:  {tract[TARGET].mean():.4f}')
-    print(f'  Avg predicted:         {tract["predicted_rg"].mean():.4f}')
-    print(f'  Tract R2:              {r2_score(tract[TARGET], tract["predicted_rg"]):.4f}')
-    print(f'  Latest median rent:    ${latest.get("median_gross_rent", "N/A"):,.0f}' if 'median_gross_rent' in tract.columns else '')""")
+# ── Version comparison ──
+add("markdown", "---\\n## 7. Version Comparison (v2 → v3 → v4)")
 
-# ── V2 vs V3 comparison ──
-add("markdown", """---
-## 7. v2 vs v3 Comparison""")
-
-add("code", """# v2 baseline results (from previous run)
-v2_results = pd.DataFrame({
-    'Model': ['OLS', 'Lasso', 'Random Forest', 'XGBoost'],
-    'v2 Test R2': [0.0201, 0.0202, 0.0756, 0.0782],
+add("code", """# Version comparison
+v_compare = pd.DataFrame({
+    'Model': ['OLS', 'Lasso', 'Random Forest', 'XGBoost', 'LightGBM', 'CatBoost', 'Stacked Ensemble', 'Two-Stage'],
+    'v2 Test R2': [0.0201, 0.0202, 0.0756, 0.0782, np.nan, np.nan, np.nan, np.nan],
+    'v3 Test R2': [0.0245, 0.0250, 0.1951, 0.2919, 0.4549, 0.2492, np.nan, 0.3147],
+    'v4 Test R2': [
+        r2_score(y_test,y_ols_te), r2_score(y_test,y_las_te), r2_score(y_test,y_rf_te),
+        r2_score(y_test,y_xgb_te), r2_score(y_test,y_lgb_te), r2_score(y_test,y_cat_te),
+        r2_score(y_test,y_stack_te), r2_score(y_2s_actual,y_2s_te),
+    ],
 })
 
-v3_test_r2 = {
-    'OLS': r2_score(y_test, y_ols_te),
-    'Lasso': r2_score(y_test, y_las_te),
-    'Random Forest': r2_score(y_test, y_rf_te),
-    'XGBoost': r2_score(y_test, y_xgb_te),
-}
-v2_results['v3 Test R2'] = v2_results['Model'].map(v3_test_r2)
-v2_results['Improvement'] = v2_results['v3 Test R2'] - v2_results['v2 Test R2']
-v2_results['Improvement %'] = ((v2_results['v3 Test R2'] / v2_results['v2 Test R2']) - 1) * 100
-
-# Add v3-only models
-v3_only = pd.DataFrame({
-    'Model': ['LightGBM', 'CatBoost', 'Two-Stage'],
-    'v2 Test R2': [np.nan, np.nan, np.nan],
-    'v3 Test R2': [r2_score(y_test, y_lgb_te), r2_score(y_test, y_cat_te), r2_score(y_2s_actual, y_2s_te)],
-    'Improvement': [np.nan, np.nan, np.nan],
-    'Improvement %': [np.nan, np.nan, np.nan],
-})
-comparison = pd.concat([v2_results, v3_only], ignore_index=True)
-
-fig, ax = plt.subplots(figsize=(12, 6))
-x = np.arange(len(comparison))
-w = 0.35
-b1 = ax.bar(x[comparison['v2 Test R2'].notna()] - w/2, comparison.loc[comparison['v2 Test R2'].notna(), 'v2 Test R2'], w,
-            label='v2', color='#90a4ae', alpha=0.8)
-b2 = ax.bar(x + w/2, comparison['v3 Test R2'], w, label='v3', color='#1976d2', alpha=0.8)
-ax.set_ylabel('Test R-squared'); ax.set_title('v2 vs v3 Model Performance')
-ax.set_xticks(x); ax.set_xticklabels(comparison['Model'], rotation=30, ha='right')
+fig, ax = plt.subplots(figsize=(14, 6))
+x = np.arange(len(v_compare))
+w = 0.25
+for i, (col, color) in enumerate([('v2 Test R2','#90a4ae'), ('v3 Test R2','#42a5f5'), ('v4 Test R2','#1565c0')]):
+    vals = v_compare[col].fillna(0)
+    bars = ax.bar(x + (i-1)*w, vals, w, label=col.replace(' Test R2',''), color=color, alpha=0.85)
+    for bar in bars:
+        if bar.get_height() > 0.01:
+            ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.005, f'{bar.get_height():.3f}',
+                     ha='center', fontsize=7)
+ax.set_ylabel('Test R-squared'); ax.set_title('Model Performance: v2 → v3 → v4')
+ax.set_xticks(x); ax.set_xticklabels(v_compare['Model'], rotation=35, ha='right')
 ax.legend()
-for bar in b2:
-    ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.005, f'{bar.get_height():.3f}', ha='center', fontsize=9)
 plt.tight_layout(); plt.show()
-
-print(comparison.round(4).to_string(index=False))""")
+print(v_compare.round(4).to_string(index=False))""")
 
 # ═══════════════════════════════════════════════════════════════
-# SECTION 8: KEY FINDINGS
+# CLUSTER ANALYSIS
 # ═══════════════════════════════════════════════════════════════
 add("markdown", """---
-## 8. Key Findings
+## 8. Neighborhood Archetype Analysis
+How does model performance vary across cluster types? Do some neighborhood archetypes
+have more predictable rent growth than others?""")
 
-### What Improved in v3
-1. **Lagged rent growth** is the dominant predictor — past rent trends strongly predict future rent growth (autoregressive behavior)
-2. **Spatial lag** captures neighborhood/market momentum effects
-3. **Relative-to-CBSA features** normalize for market-level differences more effectively than raw values
-4. **Housing unit growth** (supply) provides a meaningful signal, especially in high-growth markets
-5. **LightGBM/CatBoost** modestly outperform XGBoost with better regularization
+add("code", """# Per-cluster model performance
+cluster_perf = []
+for cl in sorted(df_clean['cluster'].unique()):
+    mask_cl = df_clean['cluster'] == cl
+    cl_actual = df_clean.loc[mask_cl, TARGET].values
+    cl_pred = df_clean.loc[mask_cl, 'predicted_rg'].values
+    cl_r2 = r2_score(cl_actual, cl_pred) if len(cl_actual) > 10 else np.nan
+    cluster_perf.append({
+        'cluster': int(cl),
+        'n_tracts': df_clean.loc[mask_cl, 'GEOID'].nunique(),
+        'n_obs': len(cl_actual),
+        'avg_rent_growth': cl_actual.mean(),
+        'std_rent_growth': cl_actual.std(),
+        'R2': cl_r2,
+    })
+cluster_perf_df = pd.DataFrame(cluster_perf)
 
-### Model Insights
-- **Tree models >> Linear models**: Non-linear relationships dominate (rent growth is not linearly driven)
-- **Panel FE** reveals which features matter *within* a tract over time vs *across* tracts
-- **Two-Stage decomposition** cleanly separates macro cycles from local dynamics
-- **Temporal split** shows models are weaker at predicting into new macro regimes (2022-23 rate shock)
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+colors = plt.cm.Set2(np.linspace(0, 1, best_k))
 
-### Top Drivers of Tract-Level Rent Growth
-1. **Prior rent growth** (momentum/mean reversion)
-2. **Spatial/market momentum** (rising tide lifts all boats)
+axes[0].bar(cluster_perf_df['cluster'].astype(str), cluster_perf_df['R2'], color=colors, edgecolor='black')
+axes[0].set_xlabel('Cluster'); axes[0].set_ylabel('R2')
+axes[0].set_title('Model R2 by Cluster')
+
+axes[1].bar(cluster_perf_df['cluster'].astype(str), cluster_perf_df['avg_rent_growth'], color=colors, edgecolor='black')
+axes[1].set_xlabel('Cluster'); axes[1].set_ylabel('Avg Rent Growth')
+axes[1].set_title('Avg Rent Growth by Cluster')
+axes[1].axhline(y=0, color='black', lw=0.5, ls='--')
+
+axes[2].bar(cluster_perf_df['cluster'].astype(str), cluster_perf_df['std_rent_growth'], color=colors, edgecolor='black')
+axes[2].set_xlabel('Cluster'); axes[2].set_ylabel('Std Dev')
+axes[2].set_title('Rent Growth Volatility by Cluster')
+
+plt.tight_layout(); plt.show()
+print(cluster_perf_df.round(4).to_string(index=False))""")
+
+add("code", """# Cluster rent growth time series
+fig, ax = plt.subplots(figsize=(12, 6))
+for cl in sorted(df_clean['cluster'].unique()):
+    ts = df_clean[df_clean['cluster']==cl].groupby('year')[TARGET].median()
+    ax.plot(ts.index, ts.values, 'o-', label=f'Cluster {int(cl)}', lw=2, markersize=6)
+ax.axhline(y=0, color='black', lw=0.5, ls='--')
+ax.set_xlabel('Year'); ax.set_ylabel('Median Real Rent Growth')
+ax.set_title('Rent Growth by Neighborhood Archetype Over Time')
+ax.legend()
+plt.tight_layout(); plt.show()""")
+
+# ═══════════════════════════════════════════════════════════════
+# KEY FINDINGS
+# ═══════════════════════════════════════════════════════════════
+add("markdown", """---
+## 9. Key Findings
+
+### v4 Improvements
+1. **True spatial weights** (queen contiguity) provide a more accurate neighborhood effect than county averages
+2. **K-means archetypes** reveal that rent growth dynamics differ by neighborhood type — some clusters are much more predictable
+3. **Stacked ensemble** squeezes marginal gains by combining model strengths
+4. **Time-series CV** exposes temporal instability: models perform well in similar regimes but struggle with structural breaks (2022-23 rate shock)
+
+### Best Models
+- **Stacked Ensemble / LightGBM** — highest test R-squared on random split
+- **Two-Stage** — cleanest decomposition of macro vs local drivers
+- **Panel FE** — reveals within-tract causal dynamics
+
+### Top Drivers
+1. **Prior rent growth** (autoregressive momentum)
+2. **Spatial lag** (neighborhood contagion)
 3. **Population growth** (demand)
 4. **Income growth** (purchasing power)
-5. **Housing supply growth** (new construction pressure)
+5. **Housing supply growth** (new construction)
 6. **Rent-to-income ratio** (affordability ceiling)
-7. **Macro conditions** (mortgage rates, inflation)
+7. **Mortgage rates** (macro financing conditions)
 
-### Caveats
-- ACS 5-year estimates are rolling averages (smooth out year-to-year variation)
-- Lagged rent growth introduces autocorrelation risk in OLS
-- R-squared reflects prediction of *deviations from mean*, not directional accuracy
-- Spatial lag computed at county level (true neighbors would require geometry)
-- COVID period (2020-21) creates structural breaks that models struggle with""")
+### Limitations
+- ACS 5-year estimates smooth annual variation
+- Temporal instability: 2022-23 rate shock fundamentally changed dynamics
+- Spatial weights assume contiguity = influence (true influence is more complex)
+- Lagged features create look-ahead risk if not carefully separated temporally""")
 
 add("markdown", """---
-## 9. Next Steps & Ideas
+## 10. Future Directions
 
-Potential enhancements for future iterations:
-- **Zillow/Apartment List rent indices** at ZIP/metro for higher-frequency dependent variable
-- **Walk Score / Transit Score** APIs for neighborhood amenity data
-- **Spatial weights matrix** using tract boundaries for true spatial econometrics
-- **SHAP values** for model-agnostic feature importance explanations
-- **Time-series cross-validation** (expanding window) for more robust temporal evaluation
-- **Ensemble/stacking** of best models for marginal gains
-- **Tract clustering** (k-means on features) to identify neighborhood archetypes""")
+- **SHAP values** for model-agnostic feature explanations
+- **Zillow/CoStar rent indices** for higher-frequency dependent variable
+- **Walk Score / Transit Score** APIs for amenity data
+- **Spatial error / spatial Durbin models** for full spatial econometrics
+- **Neural network / TabNet** for potential further gains
+- **Geographic visualization** of predictions and residuals on maps""")
 
-# ═══════════════════════════════════════════════════════════════
-# WRITE NOTEBOOK
 # ═══════════════════════════════════════════════════════════════
 out_path = "C:/Users/jonat/OneDrive/Documents/Coding/Rent Growth Backtesting/rent_growth_analysis.ipynb"
 with open(out_path, "w", encoding="utf-8") as f:
